@@ -17,24 +17,21 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", DEVICE)
 
-# ─────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────
 
 # Look-ahead horizon α = 3 h at one sample per 4 s
 ALPHA_HOURS = 3
 SAMPLING_RATE = 4                                        # seconds per sample
-ALPHA = (ALPHA_HOURS * 3600) // SAMPLING_RATE   # samples in 3 h
+ALPHA = (ALPHA_HOURS * 3600) // SAMPLING_RATE            # samples in 3 h
 
 SEGMENTS = 10    # APNOMO sub-segments per α-window
-NEIGHBOR_N = 4     # neighbours for SMOTE-style oversampling
+NEIGHBOR_N = 4   # neighbours for SMOTE-style oversampling
 
-HIDDEN_SIZE = 64    # GRU hidden units (slightly larger for richer features)
+HIDDEN_SIZE = 64  # GRU hidden units
 EPOCHS = 20
 LR = 1e-3
 BATCH_SIZE = 32
 
-# Use all 16 train machines for training; 4 test machines are separate
 TRAIN_DATA_DIR = "/kaggle/input/datasets/ani3hhh/phm-data/data/train"
 TRAIN_FAULT_DIR = "/kaggle/input/datasets/ani3hhh/phm-data/data/train/train_faults"
 TRAIN_TTF_DIR = "/kaggle/input/datasets/ani3hhh/phm-data/data/train/train_ttf"
@@ -43,18 +40,23 @@ TEST_DATA_DIR = "/kaggle/input/datasets/ani3hhh/phm-data/data/test"
 CHECKPOINT_DIR = "/kaggle/working/apnomo_checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+# Enforcer output directory
+# The enforcer module reads alarm_events.pkl from here.
+ENFORCER_DIR = "/kaggle/working/enforcer_inputs"
+os.makedirs(ENFORCER_DIR, exist_ok=True)
+
 # Primary sensors (direct fault indicators)
 PRIMARY_SIGNALS = [
     "FLOWCOOLPRESSURE",       # S14 – primary monitored signal
-    "FLOWCOOLFLOWRATE",       # S13 – flow setpoint; ratio with S14 encodes hydraulic state
+    "FLOWCOOLFLOWRATE",       # S13 – flow setpoint
     "IONGAUGEPRESSURE",       # S8  – indirect helium-leak indicator
-    "ETCHBEAMCURRENT",        # S10 – beam perturbations co-occur with vacuum degradation
-    "ETCHSUPPRESSORCURRENT",  # S12 – same
-    "ETCHSOURCEUSAGE",        # S21 – cumulative wear; conditions fault probability
-    "ACTUALSTEPDURATION",     # S24 – anomalous durations are indirect precursors
+    "ETCHBEAMCURRENT",        # S10 – beam perturbations
+    "ETCHSUPPRESSORCURRENT",  # S12
+    "ETCHSOURCEUSAGE",        # S21 – cumulative wear
+    "ACTUALSTEPDURATION",     # S24 – anomalous durations
 ]
 
-# Auxiliary setpoint / contextual signals (help distinguish true precursors)
+# Auxiliary setpoint / contextual signals
 AUX_SIGNALS = [
     "ETCHBEAMVOLTAGE",          # S9
     "ETCHSUPPRESSORVOLTAGE",    # S11
@@ -68,10 +70,6 @@ AUX_SIGNALS = [
     "ETCHAUX2SOURCETIMER",      # S23
 ]
 
-# Categorical grouping keys – NOT direct model inputs (S2-S4, S6-S7)
-# 'runnum' (S5) is numeric but purely a counter; kept for context below if present
-# 'time' (S1) is used for alignment, not as a feature
-
 ALL_FEATURE_COLS = PRIMARY_SIGNALS + AUX_SIGNALS   # 17 features
 
 
@@ -81,7 +79,7 @@ def select_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             cols.append(col)
         else:
-            df[col] = 0.0   # pad missing column
+            df[col] = 0.0
             cols.append(col)
     return df[cols]
 
@@ -89,13 +87,11 @@ def select_features(df: pd.DataFrame) -> pd.DataFrame:
 # ENGINEERED FEATURES
 
 def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Pressure / flow ratio  (avoid div-by-zero)
     if "FLOWCOOLPRESSURE" in df.columns and "FLOWCOOLFLOWRATE" in df.columns:
         denom = df["FLOWCOOLFLOWRATE"].replace(0, np.nan)
         df["FC_PRESSURE_FLOW_RATIO"] = (
             df["FLOWCOOLPRESSURE"] / denom).fillna(0)
 
-    # Short-term statistics of the primary signal
     if "FLOWCOOLPRESSURE" in df.columns:
         df["FC_PRESSURE_ROLLMEAN"] = (
             df["FLOWCOOLPRESSURE"].rolling(60, min_periods=1).mean()
@@ -117,6 +113,7 @@ N_FEATURES = len(ALL_FEATURE_COLS) + len(ENGINEERED_COLS)   # 20
 
 
 # MODEL
+
 class GRUExtractor(nn.Module):
     """Two-layer GRU feature extractor with dropout regularisation."""
 
@@ -140,15 +137,18 @@ class GRUExtractor(nn.Module):
 def load_machine(file_path: str, fault_path: str | None = None):
     df = pd.read_csv(file_path)
 
-    # Keep timestamp for alignment
     timestamps = df["time"].values if "time" in df.columns else np.arange(
         len(df))
 
-    # Select, engineer, then drop non-numeric / categorical columns
     df = add_engineered_features(df)
-    df = select_features(df)   # 17 chosen + 3 engineered = 20
 
-    # Fill any remaining NaNs from rolling ops or missing sensors
+    # This is the unscaled, unmodified sensor trace the enforcer will act on.
+    raw_primary = {}
+    for col in PRIMARY_SIGNALS:
+        raw_primary[col] = df[col].values.copy(
+        ) if col in df.columns else np.zeros(len(df))
+
+    df = select_features(df)
     df = df.ffill().bfill().fillna(0)
 
     data = df.values.astype(np.float32)
@@ -156,17 +156,17 @@ def load_machine(file_path: str, fault_path: str | None = None):
 
     if fault_path and os.path.exists(fault_path):
         fault_df = pd.read_csv(fault_path)
-        # First column is the fault timestamp
         fault_times = fault_df.iloc[:, 0].values
 
         for ft in fault_times:
-            # Find rows where timestamp falls in [ft - α*SAMPLING_RATE, ft)
             horizon_start = ft - ALPHA * SAMPLING_RATE
             mask = (timestamps >= horizon_start) & (timestamps < ft)
             labels[mask] = 1
 
-    return data, labels, timestamps
+    return data, labels, timestamps, raw_primary
 
+
+# SEGMENTATION
 
 def create_segments(data: np.ndarray, labels: np.ndarray):
     X, y = [], []
@@ -175,11 +175,25 @@ def create_segments(data: np.ndarray, labels: np.ndarray):
         label = 1 if np.any(labels[i: i + ALPHA]) else 0
         X.append(seg)
         y.append(label)
-
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 
-# NEIGHBOUR-BASED OVERSAMPLING
+# segment raw
+
+def create_raw_segments(raw_primary: dict, n_windows: int) -> list[dict]:
+    segs = []
+    for w in range(n_windows):
+        start = w * ALPHA
+        end = start + ALPHA
+        window = {}
+        for col, arr in raw_primary.items():
+            window[col] = arr[start:end] if end <= len(arr) else arr[start:]
+        segs.append(window)
+    return segs
+
+
+# OVERSAMPLING
+
 def neighbor_oversample(X: np.ndarray, y: np.ndarray) -> tuple:
     X_min = X[y == 1]
     X_maj = X[y == 0]
@@ -187,28 +201,25 @@ def neighbor_oversample(X: np.ndarray, y: np.ndarray) -> tuple:
     if len(X_min) == 0:
         return X, y
 
-    # Flatten segments for distance computation, then reshape back
     flat = X_min.reshape(len(X_min), -1)
     k = min(NEIGHBOR_N, len(X_min) - 1)
 
-    n_synthetic = len(X_maj) - len(X_min)   # balance to 1:1
+    n_synthetic = len(X_maj) - len(X_min)
     if n_synthetic <= 0:
         return X, y
 
     if k < 1:
-        # Too few minority samples – just duplicate randomly
         idx = np.random.choice(len(X_min), size=n_synthetic, replace=True)
         X_syn = X_min[idx]
     else:
         nbrs = NearestNeighbors(
             n_neighbors=k + 1, algorithm="ball_tree").fit(flat)
-        # shape (n_min, k+1); index 0 is self
         _, indices = nbrs.kneighbors(flat)
 
         X_syn_list = []
         for _ in range(n_synthetic):
             i = np.random.randint(len(X_min))
-            j = indices[i, np.random.randint(1, k + 1)]   # skip self at 0
+            j = indices[i, np.random.randint(1, k + 1)]
             lam = np.random.rand()
             X_syn_list.append(X_min[i] + lam * (X_min[j] - X_min[i]))
         X_syn = np.array(X_syn_list, dtype=np.float32)
@@ -221,31 +232,29 @@ def neighbor_oversample(X: np.ndarray, y: np.ndarray) -> tuple:
 
 
 # TRAIN FEATURE EXTRACTOR
+
 def train_feature_extractor(files: list, scaler: StandardScaler):
-    # ── First pass: collect all data to fit the scaler ──────────────────────
     print("Fitting global scaler on training data …")
     all_data = []
     for file in files:
         base = os.path.basename(file).replace("_DC_train.csv", "")
         fault_file = os.path.join(
             TRAIN_FAULT_DIR, f"{base}_train_fault_data.csv")
-        data, _, _ = load_machine(file, fault_file)
+        # load_machine now returns 4 values; unpack accordingly
+        data, _, _, _ = load_machine(file, fault_file)
         all_data.append(data)
 
     scaler.fit(np.concatenate(all_data, axis=0))
     print("Scaler fitted.")
 
-    # ── Build model after we know input dimension ────────────────────────────
     model = GRUExtractor(N_FEATURES).to(DEVICE)
     classifier = nn.Linear(HIDDEN_SIZE, 1).to(DEVICE)
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(classifier.parameters()), lr=LR
     )
-    # mild class-weight boost
     pos_weight = torch.tensor([10.0], device=DEVICE)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # ── Training loop ────────────────────────────────────────────────────────
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
         model.train()
@@ -255,7 +264,7 @@ def train_feature_extractor(files: list, scaler: StandardScaler):
             fault_file = os.path.join(
                 TRAIN_FAULT_DIR, f"{base}_train_fault_data.csv")
 
-            data, labels, _ = load_machine(file, fault_file)
+            data, labels, _, _ = load_machine(file, fault_file)
             data = scaler.transform(data)
 
             X, y = create_segments(data, labels)
@@ -264,7 +273,6 @@ def train_feature_extractor(files: list, scaler: StandardScaler):
 
             X, y = neighbor_oversample(X, y)
 
-            # Mini-batch training
             perm = np.random.permutation(len(X))
             X, y = X[perm], y[perm]
 
@@ -290,6 +298,7 @@ def train_feature_extractor(files: list, scaler: StandardScaler):
 
 
 # FEATURE EXTRACTION
+
 def extract_features(
     model: GRUExtractor,
     files: list,
@@ -298,6 +307,7 @@ def extract_features(
 ):
     model.eval()
     feats, all_labels = [], []
+    raw_segs_by_machine = []   # NEW
 
     with torch.no_grad():
         for file in files:
@@ -311,12 +321,17 @@ def extract_features(
                 if os.path.exists(candidate):
                     fault_file = candidate
 
-            data, labels, _ = load_machine(file, fault_file)
+            data, labels, _, raw_primary = load_machine(file, fault_file)
             data = scaler.transform(data)
 
             X, y = create_segments(data, labels)
             if len(X) == 0:
+                raw_segs_by_machine.append([])
                 continue
+
+            # Raw segments aligned with X/y windows
+            raw_segs = create_raw_segments(raw_primary, n_windows=len(X))
+            raw_segs_by_machine.append(raw_segs)
 
             for seg, label in zip(X, y):
                 tensor = torch.tensor(seg).unsqueeze(0).to(DEVICE)
@@ -324,15 +339,19 @@ def extract_features(
                 feats.append(feat)
                 all_labels.append(label)
 
-    return np.array(feats, dtype=np.float32), np.array(all_labels, dtype=np.float32)
+    return (
+        np.array(feats, dtype=np.float32),
+        np.array(all_labels, dtype=np.float32),
+        raw_segs_by_machine,
+    )
 
 
 # PER-SEGMENT PREDICTORS
+
 def build_segment_features(full_feats: np.ndarray, full_labels: np.ndarray):
     n = len(full_feats)
     seg_size = max(1, n // SEGMENTS)
-    seg_X = []
-    seg_y = []
+    seg_X, seg_y = [], []
 
     for q in range(SEGMENTS):
         start = q * seg_size
@@ -348,26 +367,23 @@ def train_predictors(features: np.ndarray, labels: np.ndarray):
     predictors = []
 
     for q in range(SEGMENTS):
-        # Train on data from segment q onward (cumulative evidence)
         X_cum = np.concatenate(seg_X[q:], axis=0)
         y_cum = np.concatenate(seg_y[q:], axis=0)
 
         clf = LogisticRegression(max_iter=500, class_weight="balanced", C=0.5)
         clf.fit(X_cum, y_cum)
         predictors.append(clf)
-        print(f"Segment {q+1}/{SEGMENTS} predictor trained "
-              f"({int(y_cum.sum())} positives / {len(y_cum)} total)")
+        print(f"Segment {q+1} predictor trained")
 
     return predictors
 
-# MULTI-OBJECTIVE THRESHOLD SEARCH
 
+# THRESHOLD SEARCH
 
 def find_best_threshold(prob_matrix: list, y_true: np.ndarray):
     BETA = 0.5
 
     all_probs = np.unique(np.array(prob_matrix).flatten())
-    # Sample up to 200 threshold candidates for efficiency
     if len(all_probs) > 200:
         all_probs = np.percentile(all_probs, np.linspace(0, 100, 200))
 
@@ -376,8 +392,7 @@ def find_best_threshold(prob_matrix: list, y_true: np.ndarray):
     if not thresholds:
         return 0.5
 
-    best_t = 0.5
-    best_score = -1.0
+    best_t, best_score = 0.5, -1.0
 
     for t in thresholds:
         preds, segs = [], []
@@ -401,70 +416,133 @@ def find_best_threshold(prob_matrix: list, y_true: np.ndarray):
     return best_t
 
 
-# EARLINESS METRIC
+# EARLINESS
+
 def compute_earliness(segs: list, y: np.ndarray) -> float:
     vals = [s / SEGMENTS for s, label in zip(segs, y)
             if label == 1 and s is not None]
     return float(np.mean(vals)) if vals else 1.0
 
 
+# BUILD & SAVE ALARM EVENTS
+
+def build_alarm_events(
+    prob_matrix: list,
+    threshold: float,
+    test_labels: np.ndarray,
+    raw_segs_by_machine: list,
+    test_files: list,
+) -> list[dict]:
+    """
+    For every test window where APNOMO fires an alarm, package:
+
+      machine_id        – basename of the source CSV
+      window_idx        – global window index across all test machines
+      alarm_segment     – sub-segment index (0..SEGMENTS-1) where threshold crossed
+      remaining_horizon – number of α-windows left until end of prediction horizon
+                          (= SEGMENTS - alarm_segment - 1)
+      remaining_seconds – remaining_horizon expressed in wall-clock seconds
+      prob_trace        – full SEGMENTS-length probability vector for this window
+      true_label        – 1 if this is a genuine pre-anomaly window, else 0
+      raw_signals       – dict {signal_name -> np.array}  unscaled sensor values
+                          for THIS α-window, available for the enforcer to act on
+
+    alarm_events with pred == 0 are excluded (no alarm → no enforcement needed).
+    """
+    alarm_events = []
+
+    # Flatten raw_segs_by_machine back to a per-window list aligned with prob_matrix
+    flat_raw = []
+    for machine_segs in raw_segs_by_machine:
+        flat_raw.extend(machine_segs)
+
+    # Build machine-id lookup (one entry per window, same order as flat_raw)
+    machine_ids = []
+    for file, machine_segs in zip(test_files, raw_segs_by_machine):
+        base = os.path.basename(file).replace("_DC_test.csv", "")
+        machine_ids.extend([base] * len(machine_segs))
+
+    for w_idx, (row, true_label) in enumerate(zip(prob_matrix, test_labels)):
+        pred, alarm_seg = 0, None
+        for seg_idx, p in enumerate(row):
+            if p >= threshold:
+                pred, alarm_seg = 1, seg_idx
+                break
+
+        if pred == 0:
+            continue   # no alarm → nothing for the enforcer to do
+
+        remaining_horizon = SEGMENTS - alarm_seg - 1
+        remaining_seconds = remaining_horizon * ALPHA * SAMPLING_RATE  # wall-clock
+
+        event = {
+            "machine_id":        machine_ids[w_idx] if w_idx < len(machine_ids) else f"machine_{w_idx}",
+            "window_idx":        w_idx,
+            "alarm_segment":     alarm_seg,
+            "remaining_horizon": remaining_horizon,   # in sub-segments
+            "remaining_seconds": remaining_seconds,   # in seconds
+            "prob_trace":        np.array(row),
+            "true_label":        int(true_label),
+            # Unscaled primary-signal snapshots for the enforcer to act on.
+            # Each value is a 1-D array of ALPHA samples.
+            "raw_signals":       flat_raw[w_idx] if w_idx < len(flat_raw) else {},
+        }
+        alarm_events.append(event)
+
+    return alarm_events
+
+
+# MAIN
+
 def main():
-    # Collect files
     train_files = sorted(
         glob.glob(os.path.join(TRAIN_DATA_DIR, "*_DC_train.csv")))
     test_files = sorted(
         glob.glob(os.path.join(TEST_DATA_DIR,  "*_DC_test.csv")))
 
-    # If test directory doesn't exist or has no files, fall back to holding
-    # out the last 4 training machines (original split behaviour)
     if not test_files:
         print("No separate test files found – using last 4 train machines as test set.")
         np.random.seed(42)
         np.random.shuffle(train_files)
         train_files, test_files = train_files[:-4], train_files[-4:]
 
-    print(f"Train machines : {len(train_files)}")
-    print(f"Test  machines : {len(test_files)}")
+    print(f"Train machines: {len(train_files)}")
+    print(f"Test  machines: {len(test_files)}")
 
-    # Shared scaler (fit only on train)
     scaler = StandardScaler()
 
-    # Train GRU feature extractor
+    # Train
     model = train_feature_extractor(train_files, scaler)
 
-    torch.save(
-        model.state_dict(),
-        os.path.join(CHECKPOINT_DIR, "feature_extractor.pt"),
-    )
+    torch.save(model.state_dict(), os.path.join(
+        CHECKPOINT_DIR, "feature_extractor.pt"))
     joblib.dump(scaler, os.path.join(CHECKPOINT_DIR, "scaler.pkl"))
 
     # Extract features
-    train_feats, train_labels = extract_features(
+    train_feats, train_labels, _ = extract_features(
         model, train_files, scaler, fault_dir=TRAIN_FAULT_DIR
     )
-    test_feats, test_labels = extract_features(
+    test_feats, test_labels, raw_segs_by_machine = extract_features(
         model, test_files, scaler, fault_dir=TRAIN_FAULT_DIR
     )
 
-    print(
-        f"Train windows : {len(train_labels)}  |  anomalies : {int(train_labels.sum())}")
-    print(
-        f"Test  windows : {len(test_labels)}   |  anomalies : {int(test_labels.sum())}")
+    print(f"Train anomalies: {int(train_labels.sum())}")
+    print(f"Test  anomalies: {int(test_labels.sum())}")
 
-    # Train per-segment predictors
+    # Per-segment predictors
     predictors = train_predictors(train_feats, train_labels)
     joblib.dump(predictors, os.path.join(CHECKPOINT_DIR, "predictors.pkl"))
 
-    # Build probability matrix on test set
+    # Probability matrix
     prob_matrix = []
     for feat in test_feats:
         probs = [clf.predict_proba(feat.reshape(1, -1))[0][1]
                  for clf in predictors]
         prob_matrix.append(probs)
 
-    # Multi-objective threshold search
+    # Threshold search
     threshold = find_best_threshold(prob_matrix, test_labels)
-    print(f"\nBest threshold : {threshold:.6f}")
+    print(f"\nBest threshold: {threshold:.6f}")
 
     # Final predictions
     preds, segs = [], []
@@ -483,10 +561,39 @@ def main():
     earliness = compute_earliness(segs, test_labels)
 
     print("\n========= FINAL METRICS =========")
-    print(f"Precision    : {precision:.4f}")
-    print(f"Recall       : {recall:.4f}")
-    print(f"F1-score     : {f1:.4f}")
-    print(f"Earliness-T  : {earliness:.4f}")
+    print(f"Precision   : {precision:.4f}")
+    print(f"Recall      : {recall:.4f}")
+    print(f"F1-score    : {f1:.4f}")
+    print(f"Earliness-T : {earliness:.4f}")
+
+    alarm_events = build_alarm_events(
+        prob_matrix=prob_matrix,
+        threshold=threshold,
+        test_labels=test_labels,
+        raw_segs_by_machine=raw_segs_by_machine,
+        test_files=test_files,
+    )
+
+    enforcer_payload = {
+        "alarm_events":   alarm_events,
+        "threshold":      threshold,
+        "alpha":          ALPHA,
+        "sampling_rate":  SAMPLING_RATE,
+        "segments":       SEGMENTS,
+        "primary_signals": PRIMARY_SIGNALS,
+    }
+    payload_path = os.path.join(ENFORCER_DIR, "alarm_events.pkl")
+    joblib.dump(enforcer_payload, payload_path)
+
+    print(f"\nEnforcer payload saved → {payload_path}")
+    print(f"  Total alarm events  : {len(alarm_events)}")
+    print(
+        f"  True-positive alarms: {sum(e['true_label'] for e in alarm_events)}")
+    print(
+        f"  False-positive alarms: {sum(1 - e['true_label'] for e in alarm_events)}")
+    print("  Keys in each event  : machine_id, window_idx, alarm_segment,")
+    print("                        remaining_horizon, remaining_seconds,")
+    print("                        prob_trace, true_label, raw_signals")
 
 
 if __name__ == "__main__":
