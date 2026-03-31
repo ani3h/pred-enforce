@@ -16,7 +16,6 @@ PredictiveEnforcement is an AI-driven system for **early time-series anomaly pre
 PredictiveEnforcement/
 │── data/                 # PHM Dataset
 │── src/                  # Core APNOMO implementation (training + prediction)
-│── runtime/              # Runtime monitoring & enforcement logic
 │── results/              # Logs, metrics, and visualizations
 │── README.md
 │── requirements.txt
@@ -53,7 +52,7 @@ python src/predict.py
 5. **Run Runtime Enforcement**
 
 ```bash id="m5x8kl"
-python runtime/enforcer.py
+python src/enforcer.py
 ```
 
 ## Results
