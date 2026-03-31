@@ -44,22 +44,16 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4. **Train Model**
-
-```bash id="v4b1qt"
-python src/train.py
-```
-
-5. **Run Early Prediction**
+4. **Run Early Prediction**
 
 ```bash id="h2n7az"
 python src/predict.py
 ```
 
-6. **Run Runtime Enforcement**
+5. **Run Runtime Enforcement**
 
 ```bash id="m5x8kl"
-python runtime/monitor.py
+python runtime/enforcer.py
 ```
 
 ## Results
